@@ -39,6 +39,13 @@ You MUST follow these or the session becomes unable to run many iterations:
   blocked, mark it `needs-human-review` with the specific question embedded
   in the spec file under `## Escalation`, and move on. Asking mid-loop
   blocks the entire session waiting on the human.
+- **The temptation to call `ask_user` IS the escalation signal.** If you
+  find yourself composing an `ask_user` question — about scope, design,
+  fix direction, "should I continue", anything — STOP composing. That is
+  itself proof the task is unclear enough to escalate. Embed the exact
+  question you were about to ask into the spec file under `## Escalation`,
+  mark the task `needs-human-review`, commit, and pick the next task.
+  Do not rationalize "this one question is OK" — it isn't.
 - **You may** read tiny coordination files yourself: `tasks/index.yaml` (small,
   pick next task), the picked task's spec file (one read per iteration), and
   `progress.md` last 20 lines if relevant. These are the only main-context reads.
@@ -187,7 +194,20 @@ CREATE TABLE IF NOT EXISTS ralph_delivery_grades (
 );
 ```
 
-2. Run **pre-flight** via ONE `task` sub-agent (Haiku, sync). Prompt it to run:
+2. **Clean stale build artifacts** so the LSP MCP doesn't index them
+   (~1,200 extra files = ~30% LSP cold-start overhead per audit data).
+   Dispatch ONE `task` sub-agent (Haiku, sync) to run:
+
+```
+pnpm exec turbo run clean 2>/dev/null || find . -type d -name dist -not -path '*/node_modules/*' -prune -exec rm -rf {} +
+```
+
+   Then a `pnpm install` to restore any cleaned package outputs the
+   workspace depends on. This is a one-time per-session cost (~30s) that
+   pays back via faster LSP queries in every sub-agent for the rest of
+   the session.
+
+3. Run **pre-flight** via ONE `task` sub-agent (Haiku, sync). Prompt it to run:
 
 ```
 set -a && source .env && set +a && pnpm build && pnpm test && pnpm test:api:boot && pnpm test:integration
@@ -200,7 +220,7 @@ If pre-flight fails, do NOT pick a real task. Instead, create a
 fixer rounds don't restore green, document the blocker in
 `knowledge/critical.md`, mark the task `blocked`, and exit the session.
 
-3. Check the working tree is clean (`git status --short` — short output only).
+4. Check the working tree is clean (`git status --short` — short output only).
    If dirty, stop and tell the user. Don't loop on a dirty tree.
 
 ## Per-iteration loop
@@ -355,12 +375,20 @@ READ THESE (purposefully — not the whole codebase):
 6. Relevant `knowledge/*.md` and the task spec — they often document the
    exact constraint the change might violate.
 
-PREFER LSP (mcp-language-server) over view/grep:
+PREFER LSP (mcp-language-server) over view/grep — BUT cap each LSP call:
 - `references` to find all callers of a symbol (the cheap way to scope blast radius)
 - `definition` to jump to a symbol's source
 - `hover` to confirm signatures and types
 - `diagnostics` to get TS errors/warnings for a specific file
 - Only `view` a file when LSP cannot answer the question.
+
+**LSP TIMEOUT BUDGET: 30 seconds per call.** The LSP MCP cold-starts on
+the first query in a sub-agent process and can hang for minutes indexing
+the full monorepo (3,500+ files). If any single LSP call takes >30s,
+cancel it and fall back to `rg` + `view` for that question. Do not
+serially retry — once LSP is slow in this session, it will stay slow.
+Audit data from 2026-06-09 showed 75 min wasted on LSP cold-start timeouts
+across one session — this rule exists to prevent that.
 
 SOFT BUDGET: ~50 file reads. Past that, you're hunting, not reviewing —
 stop and submit current findings. If you genuinely need more, return
@@ -610,6 +638,11 @@ something is wrong with the gate — surface it loudly in the summary.
 - Reading source files into your own context.
 - Running `pnpm test` or `pnpm build` yourself.
 - **Calling `ask_user` mid-loop** — escalate the task and continue.
+- **Composing an `ask_user` question, even if you don't send it.** The act
+  of formulating the question proves the task is unclear; that's enough
+  evidence to escalate without bothering the human.
+- **Waiting more than 30s for an LSP query.** Cancel and fall back to
+  grep + view. Once LSP is slow in a session it stays slow.
 - **Skipping the fixer on a non-APPROVE verdict.** If the reviewer rejects
   or returns UNCERTAIN, the ONLY valid next step is dispatching the fixer.
 - **Re-dispatching the implementer for the same task in one session.**
