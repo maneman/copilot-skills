@@ -64,10 +64,13 @@ sub-agent's jobs, or signals to escalate the task and continue.
 ## Full-suite validation budget per iteration: TWO RUNS, NO MORE
 
 A full `pnpm build && pnpm test && pnpm test:api:boot && pnpm test:integration`
-run is the single largest cost (~30s+ each). Cap it strictly:
+run is the single largest cost (~10–12 min). Cap it strictly:
 
 1. **Pre-flight at session start** — once for the whole session.
-2. **Pre-commit gate at task end** (Step 5) — once per task.
+2. **Pre-commit gate at task end** (Step 5) — once per task. **Shape
+   based on diff surface**: full gate for backend-touching diffs;
+   narrow gate (build + `@copal/web` vitest only) for frontend-only
+   or docs-only diffs. See Step 5 for the exact predicate.
 
 That's it. Prek will run hooks a third time on `git commit` — unavoidable
 but cached if nothing changed. The implementer and fixer run **focused
@@ -365,7 +368,14 @@ are already in the sub-agent's context — do not re-paste them.
 ```
 Task: <task-id> — <task-title>
 
-<full task spec content embedded verbatim>
+Spec: <path/to/spec.md>
+
+**Read the spec file at the path above as your FIRST action.** It is
+the source of truth for context, implementation steps, test
+requirements, and acceptance criteria. Do not proceed without reading
+it. (Referencing the spec by path rather than embedding it verbatim
+saves a 5–10KB token cost per dispatch; the file is small and your
+file-read tools can pull it in one call.)
 
 You are the IMPLEMENTER. Do this end-to-end:
 
@@ -536,17 +546,40 @@ durable audit trail.
 
 Fill `duration_s` from the actual sub-agent wall-clock (you can compute
 this from the `read_agent` response or by tracking timestamps yourself).
-Set `suspicious_quick_verdict = 1` if `duration_s < 30`.
+Set `suspicious_quick_verdict = 1` if `duration_s < 30` AND the review
+is NOT a legitimately-narrow scoped re-review (see exemption below).
 
-**Suspicious-fast-review escalation:** If any reviewer returns in <30s on
-a non-trivial diff (more than ~10 lines changed or any file outside docs/),
-treat the verdict as unreliable. Do NOT accept its APPROVE. Instead:
+**Suspicious-fast-review escalation:** If a reviewer returns in <30s on
+a non-trivial diff (more than ~10 lines changed or any file outside
+docs/), treat the verdict as unreliable. Do NOT accept its APPROVE.
+Instead:
 
 1. Record `suspicious_quick_verdict=1` in `ralph_review_verdicts`.
 2. Dispatch a SECOND reviewer from the OTHER family (if Gemini was fast,
    use `gpt-5.5`; if GPT was fast, use `gemini-3.1-pro-preview`),
    `mode: "sync"`, same review prompt.
 3. Aggregate verdicts as normal (either rejects → reject).
+
+**Scoped re-review exemption (2026-06-10 audit):** Do NOT apply the
+escalation when ALL of the following hold:
+
+- `round >= 2` for this iteration AND
+- the dispatch prompt for this reviewer explicitly says *"verify ONLY
+  this fix"* (or equivalent narrow scoping), AND
+- the cumulative-since-previous-round diff is small (≤50 staged lines
+  in the cached diff at dispatch time).
+
+Under those conditions a <30s verdict is the *expected* shape: a
+narrow re-review of a single trivial fix should be fast. Forcing a
+second-family escalation on every R2/R3 narrow approval wastes ~3–5
+min per false positive without adding signal — the diff is small
+enough that the original reviewer's read is reliable, AND the judge
+layer still audits the resulting commit. In this case, still log
+the duration but set `suspicious_quick_verdict = 0`.
+
+When in doubt (e.g., R2 review covering a non-trivial fixer diff),
+prefer the escalation. The exemption exists for *narrow* re-reviews,
+not for *fast* ones in general.
 
 **Handling `UNCERTAIN`:** If a reviewer returns `UNCERTAIN`, do NOT auto-fail
 the task. Re-dispatch THAT reviewer once with the additional files it
@@ -598,14 +631,42 @@ If `rounds >= 3` after a rejection:
 ### Step 5 — Pre-commit gate (`task`, `claude-haiku-4.5`, sync)
 
 Dispatch ONE `task` sub-agent with `model: "claude-haiku-4.5"` to re-run
-pre-flight and verify nothing regressed at the baseline:
+pre-flight and verify nothing regressed at the baseline. **Select the
+gate shape based on the diff surface** to avoid running backend
+integration suites against frontend/docs-only changes (saves
+~5–8 min per such task; 2026-06-10 audit observed M66-021 and the
+docs-only tail of the session over-paying for unaffected suites).
+
+**Backend-touching diff** — full gate. Trigger this shape when
+`git diff --cached --name-only` contains any path matching
+`^(apps/api|extensions|packages/db|packages/core|specs)/`:
 
 ```
 set -a && source .env && set +a && pnpm build && pnpm test && pnpm test:api:boot && pnpm test:integration
 ```
 
-If it fails, treat as a reviewer rejection — back to Step 4 with the failure
-as the blocking issue.
+**Frontend-or-docs-only diff** — narrow gate. Trigger this shape when
+the diff touches NONE of those paths (typically: `apps/web/`,
+`docs/`, `knowledge/`, `tasks/`, runbook-only changes):
+
+```
+set -a && source .env && set +a && pnpm build && pnpm --filter @copal/web exec vitest run
+```
+
+Compute the predicate yourself before dispatching the sub-agent — it's
+a single `bash` call:
+
+```bash
+if git diff --cached --name-only | grep -qE '^(apps/api|extensions|packages/db|packages/core|specs)/'; then echo full; else echo narrow; fi
+```
+
+Embed the chosen gate shape directly into the sub-agent's prompt.
+**When in doubt, choose full.** False negatives (skipping a needed
+suite) ship bugs; false positives (running an unneeded suite) cost
+~6 min. The asymmetry favors the full gate on ambiguous diffs.
+
+If the gate fails, treat as a reviewer rejection — back to Step 4
+with the failure as the blocking issue.
 
 ### Step 6 — Record and commit (main agent, small)
 
@@ -656,13 +717,16 @@ said. You do not modify code.
 
 Task: <task-id> — <task-title>
 Commit SHA: <sha>
+Spec: <path/to/spec.md>
 
-<full task spec content embedded verbatim>
+**Read the spec file at the path above as your FIRST action**, before
+anything else. It carries the Acceptance Criteria you're scoring
+against. Then proceed with the reading list below.
 
 Read:
-1. The commit diff (`git show <sha>`).
-2. The task spec (above) — focus on its "Acceptance Criteria" section if
+1. The spec file (above) — focus on its "Acceptance Criteria" section if
    present.
+2. The commit diff (`git show <sha>`).
 3. The tests added or modified by the commit.
 4. Use LSP `references` to confirm callers were considered if the change
    modified exported symbols.
@@ -794,6 +858,23 @@ own context.
   (once per task). Implementer and fixer run focused tests only.
 - **Re-pasting `.github/copilot-instructions.md` content into sub-agent
   prompts** — they already have it loaded.
+- **Embedding the full task spec verbatim in sub-agent dispatch prompts** —
+  reference the spec by path (`Spec: <path/to/spec.md>`) and instruct the
+  sub-agent to read it as its first action. Verbatim embedding wastes
+  5–10KB per dispatch and adds nothing the sub-agent's file-read tools
+  can't deliver on its own.
+- **Running the full backend gate on a frontend-or-docs-only diff** —
+  Step 5 selects the gate shape based on the staged diff surface; if
+  `git diff --cached --name-only` touches none of `apps/api/`,
+  `extensions/`, `packages/db/`, `packages/core/`, `specs/`, run the
+  narrow gate (`pnpm build` + `pnpm --filter @copal/web exec vitest run`)
+  instead. Saves 5–8 min per docs-or-web-only task.
+- **Escalating narrow R2/R3 re-reviews to a second-family reviewer on
+  the <30s rule** — the scoped-re-review exemption in Step 3's
+  "Suspicious-fast-review escalation" specifically carves this out.
+  Don't escalate when round ≥ 2 AND the dispatch prompt explicitly
+  said "verify ONLY this fix" AND the cumulative-since-previous-round
+  diff is ≤50 lines.
 - **Routing every task through the Opus implementer** — use Sonnet for
   routine work per the priority table; reserve Opus for high-risk surfaces.
 - **Running two reviewers on every task** — one reviewer (Gemini) is enough
