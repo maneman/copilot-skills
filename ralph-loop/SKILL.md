@@ -194,6 +194,75 @@ CREATE TABLE IF NOT EXISTS ralph_delivery_grades (
 );
 ```
 
+### Durable grade persistence (mirror SQL writes to JSONL)
+
+The three tables above are session-local SQLite — they evaporate when
+this Copilot session ends. To make grades queryable across ralph
+sessions, **mirror every SQL write to an append-only JSONL file at
+`eng/ralph-history/grades.jsonl`** (relative to the project root).
+
+This file is the only durable audit trail; without it the end-of-session
+summary is the last opportunity to inspect grades.
+
+**Bootstrap:** dispatch a one-shot `task` sub-agent (Haiku, sync) to
+ensure the history directory exists and capture the session id:
+
+```
+mkdir -p eng/ralph-history && date -u +%Y-%m-%dT%H:%M:%SZ
+```
+
+Remember the captured timestamp as `RALPH_SESSION_ID` for use in every
+JSONL row.
+
+**Mirror format:** one JSON object per line. Always include
+`session_id`, `event`, `recorded_at`, and the same fields as the SQL
+row. Use the `task` sub-agent (or any `bash` call) to append:
+
+```bash
+printf '%s\n' '<json>' >> eng/ralph-history/grades.jsonl
+```
+
+Where `<json>` is a compact single-line JSON object. **Schema by event
+type:**
+
+- `event: "iteration_started"` — mirrors `INSERT INTO ralph_iterations`.
+  Fields: `session_id`, `event`, `recorded_at`, `iteration_id`,
+  `task_id`, `status`, `started_at`.
+- `event: "iteration_ended"` — mirrors the final `UPDATE ralph_iterations`
+  at task end (status=done | needs-human-review | blocked). Fields:
+  `session_id`, `event`, `recorded_at`, `iteration_id`, `task_id`,
+  `status`, `rounds`, `implementer_dispatches`, `fixer_dispatches`,
+  `commit_sha` (if any), `notes`.
+- `event: "review_verdict"` — mirrors `INSERT INTO ralph_review_verdicts`.
+  Fields: `session_id`, `event`, `recorded_at`, `iteration_id`,
+  `task_id`, `round`, `reviewer_model`, `verdict`, `duration_s`,
+  `suspicious_quick_verdict`, `blocking_issues` (array).
+- `event: "delivery_grade_dispatched"` — mirrors the initial INSERT
+  with `status='pending'`. Fields: `session_id`, `event`, `recorded_at`,
+  `iteration_id`, `task_id`, `commit_sha`, `judge_agent_id`,
+  `judge_model`.
+- `event: "delivery_grade_collected"` — mirrors the UPDATE that fills
+  the scores. Fields: `session_id`, `event`, `recorded_at`,
+  `iteration_id`, `task_id`, `commit_sha`, `ac_coverage_score`,
+  `code_quality_score`, `test_quality_score`, `ac_coverage_notes`,
+  `code_quality_notes`, `test_quality_notes`, `overall_notes`.
+
+**Rule:** every successful `INSERT`/`UPDATE` into the three ralph_*
+tables MUST be followed (in the same orchestrator turn when possible) by
+the corresponding JSONL append. Treat the JSONL write as part of the
+audit contract — without it, the verdict/grade didn't happen for
+historical purposes.
+
+**Read-side:** the project may ship a script that consumes this JSONL
+(e.g., `eng/ralph-evaluations.mjs` reading it for outcome counts +
+score histograms). Don't restructure existing rows — append-only.
+
+**Git policy:** decision left to the project. Default is unignored
+(committed → cross-team grade history). If the project gitignores it,
+it becomes a personal history file. Do not change the gitignore policy
+from this skill.
+
+
 2. **Clean stale build artifacts** so the LSP MCP doesn't index them
    (~1,200 extra files = ~30% LSP cold-start overhead per audit data).
    Dispatch ONE `task` sub-agent (Haiku, sync) to run:
@@ -266,9 +335,10 @@ ascending → id ascending.
 If no task matches → exit the loop and report queue status (how many ready,
 how many in-progress, how many blocked, scoped to the filter if any).
 
-Insert into `ralph_iterations` with `status='claimed'`. Edit
-`tasks/index.yaml`, `docs/prd/index.md`, and the task spec file to set status
-`in-progress`. Commit (yourself, via `bash`):
+Insert into `ralph_iterations` with `status='claimed'`. **Immediately
+mirror to `eng/ralph-history/grades.jsonl`** as an `iteration_started`
+event. Edit `tasks/index.yaml`, `docs/prd/index.md`, and the task spec
+file to set status `in-progress`. Commit (yourself, via `bash`):
 
 ```
 chore(ralph): claim <task-id>
@@ -358,7 +428,47 @@ Both cases get the **same review prompt**:
 You are an ADVERSARIAL CODE REVIEWER. Find blocking issues only — bugs,
 security vulnerabilities, logic errors, broken tenant isolation, missing
 RLS, incorrect financial math, race conditions, leaked secrets, contract
-drift. Skip style and formatting; auto-fix handles those.
+drift, and **load-bearing-claim mismatches** (see below). Skip style and
+formatting; auto-fix handles those.
+
+**Verify load-bearing claims against the code (high-signal class of bug
+the 2026-06-10 judge audit flagged across 4 of 6 tasks):**
+
+- **Atomicity / `$transaction` claims in JSDoc**: if a comment says
+  "commits together" or "single $transaction" or "atomic transition,"
+  trace the actual `$transaction` boundaries in the diff. Multiple
+  `prisma.*` calls outside one `$transaction` block are NOT atomic
+  even if individually correct. Mis-claimed atomicity is a blocking
+  issue even when the code itself works for the happy path —
+  downstream readers will trust the JSDoc and miss recovery gaps.
+- **Test name vs test body**: open every test the diff adds or
+  modifies. A test named `it('rejects unauthorized requests with
+  403', ...)` MUST actually assert a 403 response status, not a
+  `Reflect.getMetadata` check on the decorator. A file named
+  `*-orchestrator-pack.test.ts` MUST exercise the orchestrator
+  end-to-end. Reject tests whose body doesn't deliver on the name —
+  they create false regression confidence.
+- **"Mathematically covered" implementer claims**: if the implementer
+  summary or PR description says "floor test #X is mathematically
+  covered by Y," OPEN test Y and verify it actually exercises the
+  boundary (especially zero-balance, full-quantity, first/last-index
+  edge cases). Self-coverage claims are the highest-value review
+  surface.
+- **Runbook / observability / UI-affordance claims**: if the diff
+  modifies a runbook, an error code, UI copy, or any operator-facing
+  text that promises behavior ("X alert fires," "Y banner appears,"
+  "click here to retry"), grep for the implementation behind the
+  promise. Fabricated observability surfaces (alerts that don't
+  exist, channels that aren't wired) are blocking issues even though
+  the code itself ships fine — operators following the runbook in a
+  fire drill will be misled.
+- **Defense-in-depth tenant scoping**: in high-risk modules (sales,
+  accounting, payments, anything CFDI-adjacent), every Prisma query
+  in the diff MUST include explicit `tenantId` (and `companyId` where
+  applicable) predicates in addition to RLS. RLS-only is acceptable
+  ONLY when a JSDoc comment explicitly justifies it and cites that
+  the caller's tx has the GUC set. Missing predicates without
+  justification are blocking issues.
 
 READ THESE (purposefully — not the whole codebase):
 1. The full staged diff.
@@ -418,6 +528,11 @@ INSERT INTO ralph_review_verdicts
    duration_s, suspicious_quick_verdict, blocking_issues)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?);
 ```
+
+**Then immediately mirror to `eng/ralph-history/grades.jsonl`** as a
+`review_verdict` event (see "Durable grade persistence" in Per-session
+bootstrap). The SQL row is per-session-only; the JSONL line is the
+durable audit trail.
 
 Fill `duration_s` from the actual sub-agent wall-clock (you can compute
 this from the `read_agent` response or by tracking timestamps yourself).
@@ -508,6 +623,12 @@ Yourself, via `edit` + `bash`:
 5. **Never use `--no-verify`.** If pre-commit hooks reject, dispatch a fixer
    sub-agent with the hook output as the blocker and go back to Step 3.
 6. Mark `ralph_iterations.status='done'` with the commit sha in `notes`.
+   **Immediately mirror to `eng/ralph-history/grades.jsonl`** as an
+   `iteration_ended` event with the final `rounds`,
+   `implementer_dispatches`, `fixer_dispatches`, and `commit_sha`. If
+   the iteration ended via escalation (`needs-human-review`) or block
+   (`blocked`) in earlier steps, mirror the same `iteration_ended`
+   event at that exit point with the final status set accordingly.
 
 ### Step 6.5 — Dispatch the delivery judge (background, fire-and-collect-later)
 
@@ -522,6 +643,10 @@ detect rubber-stamp reviewers and acceptance-criteria drift.
 
 Insert a row into `ralph_delivery_grades` with `status='pending'` and the
 returned agent id BEFORE moving on. Collection happens later (see below).
+**Immediately mirror to `eng/ralph-history/grades.jsonl`** as a
+`delivery_grade_dispatched` event. When the judge result is later
+collected and the row is UPDATEd with scores, mirror that as a
+`delivery_grade_collected` event in the same step.
 
 ```
 You are an INDEPENDENT DELIVERY JUDGE. The task below was implemented,
@@ -593,8 +718,9 @@ summary on a stuck judge.
 
 Drop everything you remember about the just-finished task. The only state
 that persists between iterations is the SQL rows in `ralph_iterations`,
-`ralph_review_verdicts`, `ralph_delivery_grades` (for end-of-session
-audit) and the committed git history. Go to Step 1.
+`ralph_review_verdicts`, `ralph_delivery_grades`, the JSONL audit at
+`eng/ralph-history/grades.jsonl` (durable across sessions), and the
+committed git history. Go to Step 1.
 
 ## Knowledge persistence
 
@@ -629,9 +755,16 @@ When the loop exits (queue drained, N reached, or hard blocker), print:
   tasks for inspection
 - **Suggested next manual action**
 
-This summary is the only audit trail of pipeline health. If the numbers
-look too good (every task approved on first try, zero fixer rounds),
-something is wrong with the gate — surface it loudly in the summary.
+This summary is the only audit trail of pipeline health for the current
+session; the persistent audit trail is `eng/ralph-history/grades.jsonl`
+which accumulates across sessions. If the numbers look too good (every
+task approved on first try, zero fixer rounds), something is wrong with
+the gate — surface it loudly in the summary.
+
+For historical comparisons (this session's averages vs the rolling
+median across prior sessions), instruct a `task` sub-agent to read the
+JSONL and emit aggregate statistics. Do NOT load the JSONL into your
+own context.
 
 ## Anti-patterns — do not do these
 
@@ -650,6 +783,10 @@ something is wrong with the gate — surface it loudly in the summary.
   Hard cap: `implementer_dispatches == 1` per task per session.
 - **Skipping reviewer verdict logging** to `ralph_review_verdicts`. No log
   entry = the verdict didn't happen, as far as the audit is concerned.
+- **Skipping the JSONL mirror** at `eng/ralph-history/grades.jsonl` after
+  any `INSERT`/`UPDATE` to `ralph_iterations`, `ralph_review_verdicts`,
+  or `ralph_delivery_grades`. The SQL row evaporates with the session;
+  the JSONL line is the only durable audit artifact.
 - **Accepting a reviewer APPROVE that completed in <30s on a non-trivial
   diff.** Escalate to a second-family reviewer instead.
 - **Running the full validation suite more than twice per iteration** —
