@@ -732,6 +732,21 @@ specific question(s) from `blocking_reasons` under `## Escalation`.
 Commit `chore(ralph): escalate <task-id> to needs-human-review — <one-line reason>`.
 Continue to the next iteration.
 
+**Status-string convention for needs-human-review:** the
+`tasks/index.yaml` validator (`ralph validate`) only accepts
+`not-started | in-progress | done | blocked`. The richer
+`needs-human-review` string is only valid in the spec file's
+`**Status:**` header and in `docs/prd/index.md`'s table cell (where
+prose is allowed). When escalating:
+- `tasks/index.yaml` → `status: blocked` (the validator-accepted
+  closest equivalent; the escalation reason in `## Escalation` makes
+  the human-review intent visible).
+- `docs/prd/index.md` → `` `blocked` _(needs-human-review)_ `` or
+  similar prose annotation.
+- Spec file `**Status:**` line → `needs-human-review` (descriptive).
+Otherwise `ralph validate` rejects the yaml and the claim commit
+fails the pre-commit hook.
+
 #### Anti-patterns at Step 1.5
 
 - **Skipping the classifier** because the spec "looks fine." Run it
@@ -1027,8 +1042,12 @@ Return a summary of what you changed plus focused-test status.
 After the fixer returns: `git add -A`, go back to Step 3 (re-review).
 
 If `rounds >= 3` after a rejection:
-- Mark task `needs-human-review` in all three places with the reviewer's last
-  verdict embedded in the spec file under a `## Escalation` heading.
+- Mark task `needs-human-review` in all three places (per the
+  status-string convention documented at Step 1.5 → NEEDS_HUMAN:
+  `tasks/index.yaml` uses `blocked`; `docs/prd/index.md` uses
+  `` `blocked` _(needs-human-review)_ ``; spec file's `**Status:**`
+  uses `needs-human-review`) with the reviewer's last verdict embedded
+  in the spec file under a `## Escalation` heading.
 - Commit `chore(ralph): escalate <task-id> to needs-human-review`.
 - Continue to the next iteration.
 
