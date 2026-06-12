@@ -160,6 +160,9 @@ CREATE TABLE IF NOT EXISTS ralph_iterations (
   implementer_dispatches INTEGER DEFAULT 0,
   fixer_dispatches INTEGER DEFAULT 0,
   rounds INTEGER DEFAULT 0,
+  spec_readiness TEXT,           -- READY | NEEDS_FLESH_OUT | NEEDS_DESIGN | NEEDS_HUMAN | NULL
+  flesh_out_dispatches INTEGER DEFAULT 0,
+  design_dispatches INTEGER DEFAULT 0,
   notes TEXT,
   started_at TEXT DEFAULT CURRENT_TIMESTAMP,
   ended_at TEXT
@@ -249,6 +252,37 @@ type:**
   `iteration_id`, `task_id`, `commit_sha`, `ac_coverage_score`,
   `code_quality_score`, `test_quality_score`, `ac_coverage_notes`,
   `code_quality_notes`, `test_quality_notes`, `overall_notes`.
+- `event: "spec_readiness_classified"` — mirrors the UPDATE that sets
+  `ralph_iterations.spec_readiness` after Step 1.5. Fields:
+  `session_id`, `event`, `recorded_at`, `iteration_id`, `task_id`,
+  `classification` (READY | NEEDS_FLESH_OUT | NEEDS_DESIGN |
+  NEEDS_HUMAN), `confidence` (high | medium | low),
+  `blocking_reasons` (array of strings; empty for READY),
+  `design_doc_cited` (path or null), `ac_count` (int),
+  `implementation_hints_quality` (concrete | vague | absent),
+  `classifier_duration_s`.
+- `event: "spec_flesh_out_dispatched"` — mirrors the increment of
+  `flesh_out_dispatches`. Fields: `session_id`, `event`,
+  `recorded_at`, `iteration_id`, `task_id`, `design_doc_cited`.
+- `event: "spec_flesh_out_completed"` — mirrors the post-flesh-out
+  re-classification. Fields: `session_id`, `event`, `recorded_at`,
+  `iteration_id`, `task_id`, `flesh_out_commit_sha`,
+  `new_classification`, `new_ac_count`.
+- `event: "design_pass_dispatched"` — mirrors the increment of
+  `design_dispatches`. Fields: `session_id`, `event`, `recorded_at`,
+  `iteration_id`, `task_id`, `spec_path`,
+  `design_orchestrator_agent_id`, `existing_design_doc` (path if
+  the spec already cited one being revised, else null).
+- `event: "design_pass_completed"` — mirrors the post-design-pass
+  re-classification. Fields: `session_id`, `event`, `recorded_at`,
+  `iteration_id`, `task_id`, `design_doc_path`,
+  `design_doc_commit_sha`, `residual_questions_count` (int —
+  unresolved R0/R1 items in the doc), `new_classification`.
+- `event: "design_pass_aborted"` — emitted if the design pass
+  exceeded its wall-clock budget OR the design-orchestrator agent
+  returned BLOCKED. Fields: `session_id`, `event`, `recorded_at`,
+  `iteration_id`, `task_id`, `reason`,
+  `wall_clock_s`.
 
 **Rule:** every successful `INSERT`/`UPDATE` into the three ralph_*
 tables MUST be followed (in the same orchestrator turn when possible) by
@@ -266,7 +300,22 @@ it becomes a personal history file. Do not change the gitignore policy
 from this skill.
 
 
-2. **Clean stale build artifacts** so the LSP MCP doesn't index them
+2. **Queue pre-check (skip pre-flight when there's nothing to do).** Read
+   `tasks/index.yaml` yourself (small file). Apply Step 1's readiness
+   predicate (status `not-started` + deps `done` + milestone-filter
+   match if any). Count how many tasks pass.
+
+   - If the count is **0**, the rest of bootstrap is wasted work
+     (~13 min of clean+install+pre-flight that nothing will exercise).
+     **Skip steps 3, 4, 5** and emit the end-of-session summary
+     immediately. Report the same blocked/in-progress/ready breakdown
+     the loop would have reported on its first Step-1 exit.
+   - If the count is **>0**, proceed with steps 3-5 normally.
+
+   This is a cheap up-front read (one yaml parse), pays back the full
+   pre-flight cost on empty-queue invocations.
+
+3. **Clean stale build artifacts** so the LSP MCP doesn't index them
    (~1,200 extra files = ~30% LSP cold-start overhead per audit data).
    Dispatch ONE `task` sub-agent (Haiku, sync) to run:
 
@@ -279,7 +328,7 @@ pnpm exec turbo run clean 2>/dev/null || find . -type d -name dist -not -path '*
    pays back via faster LSP queries in every sub-agent for the rest of
    the session.
 
-3. Run **pre-flight** via ONE `task` sub-agent (Haiku, sync). Prompt it to run:
+4. Run **pre-flight** via ONE `task` sub-agent (Haiku, sync). Prompt it to run:
 
 ```
 set -a && source .env && set +a && pnpm build && pnpm test && pnpm test:api:boot && pnpm test:integration
@@ -292,7 +341,7 @@ If pre-flight fails, do NOT pick a real task. Instead, create a
 fixer rounds don't restore green, document the blocker in
 `knowledge/critical.md`, mark the task `blocked`, and exit the session.
 
-4. Check the working tree is clean (`git status --short` — short output only).
+5. Check the working tree is clean (`git status --short` — short output only).
    If dirty, stop and tell the user. Don't loop on a dirty tree.
 
 ## Per-iteration loop
@@ -346,6 +395,361 @@ file to set status `in-progress`. Commit (yourself, via `bash`):
 ```
 chore(ralph): claim <task-id>
 ```
+
+### Step 1.5 — Spec-readiness classifier (`task`, `claude-sonnet-4.6`, sync)
+
+**Purpose:** decide whether the just-claimed spec is ready to implement,
+needs mechanical AC-flesh-out from an existing design doc, needs a full
+design pass, or needs human input. Replaces the prior implicit
+assumption that every claimed task is implementation-ready. Most pre-
+ralph friction observed in audit sessions happened at the spec-authoring
+layer (skeleton specs, design-doc-without-AC-translation, stale specs
+that contradict shipped deps); routing those cases through the right
+remediation autonomously, instead of waiting for a human to notice,
+is the principal escalation-reduction lever.
+
+**Dispatch:** ONE `task` sub-agent, `model: "claude-sonnet-4.6"`,
+`mode: "sync"`. Prompt:
+
+```
+Task: <task-id> — <task-title>
+Spec: <path/to/spec.md>
+
+You are a SPEC-READINESS CLASSIFIER. Do NOT modify code, specs, or
+backlog. Read the spec file and (if cited) its design doc; classify
+ONLY.
+
+Read in order:
+1. The spec file at the path above (always).
+2. Any design doc the spec links to under "Design pass complete" or
+   similar (if present). Verify the design doc actually exists at
+   the cited path.
+3. The "Implementation hints" + "Acceptance criteria" sections of
+   the spec.
+
+Classify the spec into EXACTLY ONE bucket:
+
+- **READY** — implementer can claim and ship. ALL of these must hold:
+  * `ac_count >= 5` numbered acceptance criteria with verifiable
+    pass/fail predicates (not prose paragraphs).
+  * Implementation hints reference concrete file paths or named
+    primitives, not vague directions ("refactor X").
+  * If a design doc is cited, it has NO unresolved R0/R1-style
+    blocking residual questions (the design's residual questions
+    section is empty OR every entry is marked resolved).
+  * Spec body contains NO "BLOCKED on", "design skill recommended",
+    "needs flesh-out", "TBD", "needs grilling" markers.
+  * Every dep listed in the spec is shipped AND the spec body's
+    assumptions about that dep's contract still hold (e.g., it cites
+    the post-dep signature, not a pre-dep guess).
+
+- **NEEDS_FLESH_OUT** — design pass is complete; spec body is a
+  skeleton. ALL of these must hold:
+  * A design doc IS cited and exists.
+  * The design doc has NO unresolved R0/R1 blockers.
+  * `ac_count < 5` OR the spec lacks numbered ACs entirely OR the
+    spec body explicitly says "needs flesh-out from design".
+  * NO conflicting marker that pushes higher (e.g., "design skill
+    recommended" → that means NEEDS_DESIGN, not flesh-out).
+
+- **NEEDS_DESIGN** — needs a real design pass before implementation.
+  ANY of these triggers it:
+  * Spec body explicitly says "design skill recommended" or
+    "invoke design skill before implementation" or equivalent.
+  * Spec body presents multiple viable approaches without picking
+    one (genuinely open architectural question).
+  * Spec body contradicts a shipped dep's actual contract (drift
+    detected — the spec was written before the dep landed and was
+    never reconciled).
+  * Spec body has scope-creep markers ("touches >N modules",
+    "introduces new primitive", "modifies extension contracts")
+    without a corresponding design rationale.
+  * NO cited design doc AND the work is non-trivial (cross-cuts >2
+    files OR introduces a new public API OR touches a state machine).
+
+- **NEEDS_HUMAN** — ralph cannot resolve this autonomously. ANY of:
+  * Cited design doc HAS unresolved R0/R1 blocking residual
+    questions that require a product / business / accounting
+    decision (e.g., "L3 override re-grilling required" in
+    composite-refund-orchestrator design).
+  * Spec body conflicts with parent spec or an existing locked
+    decision elsewhere in the repo.
+  * Spec body references a follow-up ticket that hasn't been filed
+    yet AND that ticket is a hard prerequisite.
+  * Cited design doc's `⚠ Override` section is unresolved.
+
+**Bias:** set the bar HIGH for READY. False positives (saying READY
+when it isn't) waste an Opus implementer dispatch + a dual-reviewer
+pass + a gate run. False negatives (escalating when not needed) only
+cost the flesh-out or design pass time. When ambiguous, escalate up
+one bucket.
+
+Return JSON with EXACTLY this shape (no other text):
+
+{
+  "classification": "READY" | "NEEDS_FLESH_OUT" | "NEEDS_DESIGN" | "NEEDS_HUMAN",
+  "confidence": "high" | "medium" | "low",
+  "blocking_reasons": ["..."],
+  "design_doc_cited": "path/to/design.md" | null,
+  "design_doc_has_unresolved_R0": true | false,
+  "ac_count": <integer>,
+  "implementation_hints_quality": "concrete" | "vague" | "absent",
+  "suggested_action": "<one sentence describing next step>"
+}
+```
+
+Wall-clock budget: 2-5 minutes. If the agent runs >5 min it's
+hunting; cancel and default to NEEDS_DESIGN.
+
+**Log the verdict immediately:**
+
+```sql
+UPDATE ralph_iterations
+  SET spec_readiness = ?  -- the classification string
+  WHERE id = ?;
+```
+
+Mirror to `eng/ralph-history/grades.jsonl` as a
+`spec_readiness_classified` event (see Per-session bootstrap → JSONL
+schema).
+
+**Then route based on classification:**
+
+#### READY → continue to Step 2 normally.
+
+No further action; the implementer is dispatched as usual.
+
+#### NEEDS_FLESH_OUT → dispatch the auto-flesh-out agent.
+
+Increment `ralph_iterations.flesh_out_dispatches` to 1, then dispatch
+ONE `task` sub-agent, `agent_type: "general-purpose"`,
+`model: "claude-sonnet-4.6"`, `mode: "sync"`. Prompt:
+
+```
+Task: <task-id> — <task-title>
+Spec: <path/to/spec.md>
+Design doc: <path/to/design-doc.md>
+
+You are a SPEC FLESH-OUT AGENT. Translate the design doc's locked
+decisions, implementation shape, and test matrix into a numbered AC
+list on the spec file. Do NOT change any locked decision. Do NOT
+introduce new design choices.
+
+Steps:
+1. Read the spec file (preserve its preamble, frontmatter,
+   pre-locked constraints, grilling-lock sections, out-of-scope list).
+2. Read the design doc (focus on: § "What is decided" / "Locked
+   decisions" / L1..LN; § "Implementation shape"; § "Test matrix" or
+   testing implications; § "JSDoc — load-bearing" if present).
+3. Write a numbered "## Acceptance criteria" section on the spec
+   that translates each L1..LN decision into one or more verifiable
+   AC items. Use the same wording as the design doc's L-table where
+   it makes sense; expand to per-method/per-test ACs where the L
+   spans multiple deliverables.
+4. Write a "## Test matrix" section (table form: # | Test | Layer |
+   Purpose | AC mapping). Mirror the design doc's test list; add
+   integration tests (Testcontainer) for any L decision that involves
+   atomicity, sequence-no-gap, or cross-tenant isolation.
+5. Write "## Implementation hints" (refactor order; primitive
+   extraction order; code path citations from the design doc).
+6. Write "## Risk surface" pointing at design doc R-section.
+7. Carry the design doc's residual risks (R1..RN) into a "Residual
+   risks (carried forward from design)" section, one bullet each.
+8. Flip the spec's status from whatever it was to `not-started` (it
+   should currently be `in-progress` from the claim step — but if the
+   spec was originally `blocked` and the design doc cleared the
+   block, also update the index files).
+9. Update `tasks/index.yaml` + `docs/prd/index.md` to match (status,
+   any updated deps).
+10. Commit with `docs(<scope>): flesh out <task-id> spec from design
+    pass (<design-doc-commit-sha>)`. Use the appropriate commit
+    scope per the project's commit conventions.
+
+Do NOT make architectural choices. Do NOT add new ACs that aren't in
+the design doc. Do NOT lock decisions the design left open. If you
+hit a decision that the design didn't lock, STOP and return
+{"status":"BLOCKED","reason":"design didn't lock <X>"}; the
+orchestrator will escalate.
+
+Return: {"status":"DONE","commit_sha":"<sha>","ac_count":<n>} OR
+{"status":"BLOCKED","reason":"<why>"}.
+```
+
+After the flesh-out agent returns:
+
+- If `status=DONE`: mirror a `spec_flesh_out_completed` JSONL event
+  (with `flesh_out_commit_sha` + `new_ac_count`). Re-run Step 1.5
+  classifier ONE more time against the now-fleshed-out spec. If the
+  new classification is READY, continue to Step 2. If it's still
+  NEEDS_FLESH_OUT or anything else after one flesh-out attempt,
+  treat as escalation (see NEEDS_HUMAN below).
+- If `status=BLOCKED`: treat as escalation (NEEDS_HUMAN).
+- **Hard cap:** `flesh_out_dispatches <= 1` per task per session.
+  Never re-dispatch the flesh-out agent — if its first attempt
+  failed, the design itself is incomplete; escalate.
+
+#### NEEDS_DESIGN → auto-dispatch the design pass.
+
+The design skill at `/home/mane/.copilot/skills/design/SKILL.md` is a
+procedure (read inputs → propose multiple approaches → spawn 3 parallel
+critique agents from different model families → reconcile feedback →
+write the final design doc). Ralph dispatches a design-orchestrator
+sub-agent that reads the design skill's instructions and executes them
+against the spec. The output is a committed design doc; ralph then
+re-classifies the spec.
+
+**Hard caps (enforce on yourself before dispatching):**
+
+- `design_dispatches <= 1` per task per session. If `>= 1` already, do
+  NOT dispatch again — escalate to NEEDS_HUMAN with reason
+  "design pass already attempted this session and the re-classification
+  did not reach READY." A second design pass in one session indicates
+  the spec is fundamentally unclear; humans must intervene.
+- Wall-clock budget: **60 minutes**. If the design-orchestrator agent
+  runs longer, cancel and escalate to NEEDS_HUMAN with reason
+  "design pass exceeded 60-min budget" (mirror a `design_pass_aborted`
+  JSONL event with `reason` and `wall_clock_s`).
+
+**Dispatch:**
+
+Increment `ralph_iterations.design_dispatches` to 1. Insert a
+`design_pass_dispatched` JSONL event capturing the orchestrator agent
+id. Then dispatch ONE `task` sub-agent, `agent_type: "general-purpose"`,
+`model: "claude-opus-4.7-1m-internal"` (the design-orchestrator needs
+the largest context window because it'll be reading the spec, related
+designs, and reconciling 3 parallel critiques), `mode: "sync"`,
+60-minute initial wait if available. Prompt:
+
+```
+Task: <task-id> — <task-title>
+Spec: <path/to/spec.md>
+Design doc output path: docs/design-decisions/<derived-name>.md
+  (use the spec's "Output:" line if it cites one; otherwise derive
+   from the task title following kebab-case convention)
+Existing design doc (if the spec cites one being revised): <path or none>
+
+You are a DESIGN-PASS ORCHESTRATOR. Read and EXECUTE the design skill at
+/home/mane/.copilot/skills/design/SKILL.md against the spec above. The
+skill is the source of truth for what you must produce.
+
+Required outputs (per the design skill's "Required final output" section):
+1. Final revised design doc landed at the output path above.
+2. Critique summary (models used + substitutions).
+3. Feedback reconciliation log.
+4. Delta summary.
+5. Residual open questions (be explicit; the orchestrator uses this to
+   decide whether to escalate after your work).
+
+Discipline:
+- Honor the design skill's family-diversity rule for critique agents
+  (Anthropic + OpenAI + Google strongest models). Substitute per the
+  documented fallback chains if a model is unavailable.
+- Do NOT make product / business decisions. If the design surfaces a
+  decision that requires product input (a "R0" or "L3 override" style
+  question), document it in the design doc's "Residual open questions"
+  section as "BLOCKING — human grilling required" with the exact
+  question. Do NOT lock it yourself.
+- Do NOT modify the spec file in this dispatch — only produce the
+  design doc. The orchestrator will flesh out the spec from your
+  design doc as a separate step (auto-flesh-out after re-classification).
+- Commit the design doc with a conventional commit message:
+  `docs(<scope>): land <task-id> design (3-agent critique reconciled)`.
+  The implementer model that picks up the task afterwards will read
+  it.
+
+Return JSON:
+{
+  "status": "DONE" | "BLOCKED",
+  "design_doc_path": "<path>",
+  "design_doc_commit_sha": "<sha>",
+  "residual_questions_count": <int — count of unresolved blocking R0/R1
+    items in the final doc's "Residual open questions" section>,
+  "critique_models_used": ["<model1>", "<model2>", "<model3>"],
+  "blocked_reason": "<if BLOCKED, why>"
+}
+
+If you cannot produce a defensible design (e.g., the spec contradicts
+itself, OR the codebase doesn't have the primitives the design would
+need), return status="BLOCKED" with a specific reason. Do NOT ship a
+weak design just to satisfy the contract.
+```
+
+**After the design-orchestrator returns:**
+
+- If `status="DONE"` AND `residual_questions_count == 0`: the design
+  is unambiguous. Mirror a `design_pass_completed` JSONL event. **Re-run
+  Step 1.5 ONE more time** against the spec. Expected new
+  classification: NEEDS_FLESH_OUT (the design exists but the spec body
+  is still skeletal). If the re-classifier returns NEEDS_FLESH_OUT,
+  continue to the NEEDS_FLESH_OUT flow above (auto-flesh-out + final
+  re-classification). If the re-classifier returns READY (unlikely —
+  usually a fresh design doc means the spec body needs translation),
+  continue to Step 2. If it returns anything else, escalate to
+  NEEDS_HUMAN with the new blocking reasons.
+
+- If `status="DONE"` AND `residual_questions_count > 0`: the design
+  surfaced questions only a human can answer (e.g., the L3 override
+  in the composite refund design). Mirror `design_pass_completed`
+  with the count. Escalate to NEEDS_HUMAN with the design doc's
+  residual questions embedded under the spec's `## Escalation`
+  heading. The human grilling outcome will close the residuals; the
+  human then re-runs ralph, which re-classifies (now with R0
+  resolved), routes to NEEDS_FLESH_OUT, auto-flesh-out runs, and the
+  implementer takes over.
+
+- If `status="BLOCKED"`: mirror a `design_pass_aborted` JSONL event
+  with the `blocked_reason`. Escalate to NEEDS_HUMAN. The spec needs
+  human attention before any design can ship.
+
+- If the wall-clock budget was exceeded: cancel the agent (`stop_bash`
+  / underlying stop primitive), mirror `design_pass_aborted` with
+  `reason="60min budget exceeded"`, escalate to NEEDS_HUMAN.
+
+#### Anti-patterns at the NEEDS_DESIGN gate (in addition to Step-1.5 anti-patterns)
+
+- **Re-dispatching the design pass.** Hard cap of 1 per task per
+  session. A second dispatch in one session is a hallucination — the
+  first attempt told you something. Escalate instead.
+- **Letting the design-orchestrator agent commit changes to the
+  spec body.** The design pass produces a design doc, period. The
+  spec body is fleshed out by the separate auto-flesh-out agent. Two
+  agents, two responsibilities, two commits. Mixing them creates a
+  large diff that's hard to review and breaks the audit trail.
+- **Accepting `status="DONE"` with a thin doc.** If the design doc
+  is <200 lines, OR it doesn't cite repository file paths, OR it has
+  no critique reconciliation log, OR it has fewer than 2 approaches
+  compared, treat it as effectively BLOCKED — the design-orchestrator
+  may have rubber-stamped its own draft. Mirror the JSONL event with
+  reason "design doc below minimum quality bar" and escalate to
+  NEEDS_HUMAN.
+
+#### NEEDS_HUMAN → escalate immediately.
+
+Same shape as NEEDS_DESIGN but the escalation reason is different
+(usually: design doc has an R0/R1 the human must answer; OR the
+spec conflicts with a parent spec or locked decision). Embed the
+specific question(s) from `blocking_reasons` under `## Escalation`.
+Commit `chore(ralph): escalate <task-id> to needs-human-review — <one-line reason>`.
+Continue to the next iteration.
+
+#### Anti-patterns at Step 1.5
+
+- **Skipping the classifier** because the spec "looks fine." Run it
+  every iteration; the cost is 2-5 min and the audit value is real
+  (the classification is logged + queryable across sessions).
+- **Treating low-confidence classifier output as authoritative.** If
+  the classifier returns `confidence: "low"`, escalate one bucket
+  higher (READY → NEEDS_FLESH_OUT; NEEDS_FLESH_OUT → NEEDS_DESIGN;
+  etc.). Better to over-escalate than ship a flesh-out against a
+  half-baked design.
+- **Calling the flesh-out agent without a design doc.** If
+  `design_doc_cited` is null, the classification cannot be
+  NEEDS_FLESH_OUT — the agent has nothing to translate. The
+  classifier MUST set NEEDS_DESIGN (or NEEDS_HUMAN) in that case.
+- **Re-dispatching the flesh-out agent.** Hard cap of 1 per task
+  per session. If the first flesh-out attempt didn't yield a READY
+  classification on re-run, the design doc is incomplete; escalate
+  to NEEDS_HUMAN.
 
 ### Step 2 — Dispatch the implementer (general-purpose, model per priority, sync)
 
@@ -639,7 +1043,7 @@ docs-only tail of the session over-paying for unaffected suites).
 
 **Backend-touching diff** — full gate. Trigger this shape when
 `git diff --cached --name-only` contains any path matching
-`^(apps/api|extensions|packages/db|packages/core|specs)/`:
+`^(apps/api|extensions|packages/db|packages/core|specs|test/integration)/`:
 
 ```
 set -a && source .env && set +a && pnpm build && pnpm test && pnpm test:api:boot && pnpm test:integration
@@ -657,8 +1061,13 @@ Compute the predicate yourself before dispatching the sub-agent — it's
 a single `bash` call:
 
 ```bash
-if git diff --cached --name-only | grep -qE '^(apps/api|extensions|packages/db|packages/core|specs)/'; then echo full; else echo narrow; fi
+if git diff --cached --name-only | grep -qE '^(apps/api|extensions|packages/db|packages/core|specs|test/integration)/'; then echo full; else echo narrow; fi
 ```
+
+Note: `test/integration/` at the repo root holds the cross-package
+Testcontainer integration suite (see M66-032c and M66-032d for
+recent examples). Diffs touching only those files must still route
+to the full gate so `pnpm test:integration` runs.
 
 Embed the chosen gate shape directly into the sub-agent's prompt.
 **When in doubt, choose full.** False negatives (skipping a needed
@@ -806,12 +1215,30 @@ When the loop exits (queue drained, N reached, or hard blocker), print:
     be enforcing)
   - Count of `suspicious_quick_verdict=1` rows in `ralph_review_verdicts`
   - Reviewer verdict distribution: APPROVE / REJECT / UNCERTAIN per model
+  - **Spec-readiness classifier distribution**: count of READY /
+    NEEDS_FLESH_OUT / NEEDS_DESIGN / NEEDS_HUMAN classifications this
+    session. High NEEDS_DESIGN / NEEDS_HUMAN ratios indicate the
+    backlog has unresolved spec-authoring work upstream of ralph.
+  - **Auto-flesh-out activity**: count of `flesh_out_dispatches > 0`
+    rows + count that succeeded on the post-flesh-out re-classification.
+    Auto-flesh-out failures (flesh-out ran but re-classification still
+    didn't reach READY) are a signal the design doc is incomplete —
+    surface in WARNING.
+  - **Auto-design-pass activity**: count of `design_dispatches > 0`
+    rows + status breakdown (DONE-with-zero-residuals, DONE-with-
+    residuals → escalated to NEEDS_HUMAN, BLOCKED, budget-aborted).
+    Surface design-pass wall-clock totals to track session cost.
+    `design_dispatches > 1` per task should be impossible per the
+    hard cap; if observed, emit a CRITICAL.
   - **Delivery judge averages** across collected grades:
     `avg(ac_coverage_score)`, `avg(code_quality_score)`,
     `avg(test_quality_score)`, count of pending/failed judges
 - **Per iteration:** task id, final status, rounds, implementer dispatches,
-  fixer dispatches, commit sha (if any), three judge scores (or `pending`)
+  fixer dispatches, flesh-out dispatches, spec_readiness classification,
+  commit sha (if any), three judge scores (or `pending`)
 - **Tasks marked `blocked` or `needs-human-review`** with one-line reason
+  + classification (so the human can see which were spec-readiness
+  escalations vs implementation-failure escalations).
 - **Tasks with any judge score ≤ 2** — highlight as a WARNING block
 - **Rubber-stamp detector:** if 3+ consecutive tasks had reviewer APPROVE
   but a judge score < 3 on any dimension, emit a CRITICAL section telling
@@ -866,9 +1293,10 @@ own context.
 - **Running the full backend gate on a frontend-or-docs-only diff** —
   Step 5 selects the gate shape based on the staged diff surface; if
   `git diff --cached --name-only` touches none of `apps/api/`,
-  `extensions/`, `packages/db/`, `packages/core/`, `specs/`, run the
-  narrow gate (`pnpm build` + `pnpm --filter @copal/web exec vitest run`)
-  instead. Saves 5–8 min per docs-or-web-only task.
+  `extensions/`, `packages/db/`, `packages/core/`, `specs/`,
+  `test/integration/`, run the narrow gate (`pnpm build` +
+  `pnpm --filter @copal/web exec vitest run`) instead. Saves 5–8 min
+  per docs-or-web-only task.
 - **Escalating narrow R2/R3 re-reviews to a second-family reviewer on
   the <30s rule** — the scoped-re-review exemption in Step 3's
   "Suspicious-fast-review escalation" specifically carves this out.
@@ -894,5 +1322,41 @@ own context.
 - **Acting on judge scores in-loop** (e.g., auto-reverting a low-scored
   commit). Judges are an audit layer; humans review the warnings.
 - Marking `done` without updating all three files (yaml, index.md, spec).
+- **Skipping Step 1.5 (spec-readiness classifier)** because the spec
+  "looks ready." The classifier exists because every audit session
+  observed the same failure mode: human authors a skeleton spec, ralph
+  claims it, implementer hits a wall, escalation. Run the classifier
+  every iteration; the 2-5 min cost is recouped on the first
+  NEEDS_FLESH_OUT / NEEDS_DESIGN catch.
+- **Auto-dispatching the `design` skill blindly.** The skill is
+  auto-dispatched on NEEDS_DESIGN classifications, BUT:
+  - Hard cap: 1 design dispatch per task per session.
+  - Hard cap: 60-min wall-clock budget per design pass.
+  - The design-orchestrator agent MUST honor the design skill's
+    family-diversity rule for critique agents (Anthropic + OpenAI +
+    Google strongest models).
+  - The design-orchestrator agent MUST NOT modify the spec body —
+    only produce the design doc. Spec-body translation is the
+    separate auto-flesh-out agent's job.
+  - The orchestrator MUST validate the returned design doc meets a
+    minimum quality bar (≥200 lines, ≥2 approaches compared, critique
+    reconciliation log present, repository file-path citations). A
+    thin doc indicates a rubber-stamped design pass — escalate to
+    NEEDS_HUMAN rather than chain to flesh-out.
+- **Skipping the post-design re-classification.** After the design
+  doc lands, ALWAYS re-run Step 1.5 once. The re-classification is
+  what decides whether the design doc unblocked the task
+  (→ NEEDS_FLESH_OUT → auto-flesh-out → READY) OR surfaced a
+  blocking R0/R1 that humans must resolve (→ NEEDS_HUMAN).
+- **Running the flesh-out agent without a design doc.** The flesh-out
+  agent translates a design doc into ACs — it has nothing to translate
+  if there's no design doc. The classifier MUST set NEEDS_DESIGN (or
+  NEEDS_HUMAN) when `design_doc_cited` is null; the orchestrator MUST
+  refuse to dispatch flesh-out without a cited design doc.
+- **Running the full pre-flight gate on an empty queue.** Per-session
+  bootstrap step 2 (queue pre-check) must run BEFORE clean+install
+  +pre-flight. Skip steps 3-5 if zero ready tasks match the filter.
+  Wasted pre-flight cost is ~13 min per empty-queue invocation; the
+  yaml read costs <1s.
 
 
